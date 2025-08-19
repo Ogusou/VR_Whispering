@@ -51,5 +51,5 @@
         "temp/": true,
         "Temp/": true
     },
-    "dotnet.defaultSolution": "whispering_test_0806.sln"
+    "dotnet.defaultSolution": "VR_Whispering.sln"
 }
