@@ -1401,6 +1401,7 @@ MonoBehaviour:
   _udonSharpBackingUdonBehaviour: {fileID: 1247468958}
   selfEarThreshold: 0.32
   otherEarThreshold: 0.32
+  debugPassOtherDistance: 0
   usePalmNormalFromFingers: 1
   palmAxis: 0
   palmDotSign: -1
@@ -1430,6 +1431,16 @@ MonoBehaviour:
   activeHandsMode: 2
   enableGripSwitch: 1
   gripPressThreshold: 0.8
+  enableEnterHaptics: 1
+  hapticsDuration: 0.08
+  hapticsAmplitude: 0.7
+  hapticsFrequency: 180
+  hapticsFallbackBoth: 0
+  enableExitHaptics: 1
+  hapticsExitDuration: 0.05
+  hapticsExitAmplitude: 0.6
+  hapticsExitFrequency: 160
+  doublePulseDelay: 0.1
   useExitLoosenedThresholds: 1
   selfEarThresholdExit: 0.6
   otherEarThresholdExit: 0.6

@@ -12,6 +12,10 @@ public class WhisperManager : UdonSharpBehaviour
     public float selfEarThreshold  = 0.12f;
     public float otherEarThreshold = 0.12f;
 
+   [Header("ソロデバッグ")]
+    [Tooltip("ONにすると『相手との距離条件』を常に合格扱いにする（1人でも検証可）")]
+    public bool debugPassOtherDistance = false;
+
     [Header("掌法線の算出")]
     [Tooltip("指数/小指/中指prox から掌法線を再構成（推奨）")]
     public bool usePalmNormalFromFingers = true;
@@ -66,6 +70,7 @@ public class WhisperManager : UdonSharpBehaviour
     [Header("検出する手")]
     [Tooltip("0=右のみ / 1=左のみ / 2=両手")]
     public int activeHandsMode = 2;
+    
 
     [Header("グリップで手選択（VR）")]
     public bool enableGripSwitch = true;
@@ -74,6 +79,30 @@ public class WhisperManager : UdonSharpBehaviour
     // 立ち上がり検出と選択手（-1:未選択 / 0:右 / 1:左）
     private bool _prevGripR = false, _prevGripL = false;
     private int _selectedHand = -1;
+
+   [Header("Haptics (Whisper Enter)")]
+    [Tooltip("Whisper開始時に振動させる")]
+    public bool enableEnterHaptics = true;
+    [Range(0f, 0.5f)] public float hapticsDuration = 0.08f;
+    [Range(0f, 1f)]   public float hapticsAmplitude = 0.7f;
+    [Tooltip("推奨: 0〜320Hz 程度")]
+    public float hapticsFrequency = 180f;
+    [Tooltip("対象手が特定できない時に両手を振動させる")]
+    public bool hapticsFallbackBoth = true;
+
+
+    [Header("Haptics (Whisper Exit)")]
+    [Tooltip("Whisper解除時にも振動させる")]
+    public bool enableExitHaptics = true;
+    [Range(0f, 0.5f)] public float hapticsExitDuration  = 0.05f;
+    [Range(0f, 1f)]   public float hapticsExitAmplitude = 0.6f;
+    public float      hapticsExitFrequency = 160f;
+    [Tooltip("ダブルパルスの2発目までの遅延（秒）")]
+    public float doublePulseDelay = 0.10f;
+
+    // 解除ダブル用：どの手にもう一発入れるかを保持
+    private int  _cachedHapticHand = -1; // -1=不定/両手, 0=右, 1=左
+    private bool _cachedHapticBoth = false;
 
     [Header("ヒステリシス（解除側しきい値）")]
     [Tooltip("解除時は距離・dot・指本数をこちらの緩い条件で判定する")]
@@ -241,9 +270,21 @@ public class WhisperManager : UdonSharpBehaviour
                              + "  Sel:" + selStr
                              + "  Grip:" + gripStr;
         }
-        bool shouldWhisper = anyWhisper || replyAny;
-        if (shouldWhisper && !isWhispering) EnableWhisper();
-        else if (!shouldWhisper && isWhispering) DisableWhisper();
+       bool shouldWhisper = anyWhisper || replyAny;
+        if (shouldWhisper && !isWhispering)
+        {
+            EnableWhisper();
+            // どちらの手を振動させるか：_selectedHand（0=右,1=左, -1=未選択）優先 → useRight にフォールバック
+            int hapticHand = (_selectedHand >= 0) ? _selectedHand : (useRight ? 0 : 1);
+            TriggerEnterHaptics(hapticHand, evalRight, evalLeft);
+        }
+        else if (!shouldWhisper && isWhispering)
+        {
+            DisableWhisper();
+            // 解除はダブル：選択手優先 → そのフレームで有効な手 → それも無ければ両手
+            int hapticHand = (_selectedHand >= 0) ? _selectedHand : (evalRight ? 0 : (evalLeft ? 1 : 0));
+            TriggerExitHaptics(hapticHand, evalRight, evalLeft);
+        }
     }
 
     // ───────────────── 判定ひとまとめ ─────────────────
@@ -425,6 +466,7 @@ public class WhisperManager : UdonSharpBehaviour
 
     private bool IsOtherDistanceFixed(VRCPlayerApi other, bool isRight)
     {
+        if (debugPassOtherDistance) return true;
         if (other == null) return false;
         Vector3 wrist = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
         Vector3 head  = other.GetBonePosition(HumanBodyBones.Head);
@@ -434,6 +476,7 @@ public class WhisperManager : UdonSharpBehaviour
        // 解除側しきい等、閾値を指定して判定したい場合はこちらを使用
     private bool IsOtherDistanceWithThreshold(VRCPlayerApi other, bool isRight, float threshold)
     {
+        if (debugPassOtherDistance) return true;
         if (other == null) return false;
         Vector3 wrist = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
         Vector3 head = other.GetBonePosition(HumanBodyBones.Head);
@@ -535,36 +578,181 @@ public class WhisperManager : UdonSharpBehaviour
         if (stateLabel == null) return;
         stateLabel.text = on ? "Whispering" : "Normal";
     }
+    
+    // ───────────────── Haptics ─────────────────
+    private void TriggerEnterHaptics(int selectedHand, bool evalRight, bool evalLeft)
+    {
+        if (!enableEnterHaptics || localPlayer == null || !localPlayer.IsUserInVR()) return;
+        float dur  = Mathf.Max(0f, hapticsDuration);
+        float amp  = Mathf.Clamp01(hapticsAmplitude);
+        float freq = Mathf.Max(0f, hapticsFrequency);
+
+        // 0=右, 1=左, -1=未特定
+        if (selectedHand == 0)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, dur, amp, freq);
+            return;
+        }
+        if (selectedHand == 1)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left, dur, amp, freq);
+            return;
+        }
+
+        // 未特定：そのフレームで有効な方を優先、なければ両手（任意）
+        bool did = false;
+        if (evalRight)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, dur, amp, freq);
+            did = true;
+        }
+        if (!did && evalLeft)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left, dur, amp, freq);
+            did = true;
+        }
+        if (!did && hapticsFallbackBoth)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, dur, amp, freq);
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left, dur, amp, freq);
+        }
+    }
+
+    // ───────── 解除（必ずダブル） ─────────
+    private void TriggerExitHaptics(int selectedHand, bool evalRight, bool evalLeft)
+    {
+        if (!enableExitHaptics || localPlayer == null || !localPlayer.IsUserInVR()) return;
+        float dur  = Mathf.Max(0f, hapticsExitDuration);
+        float amp  = Mathf.Clamp01(hapticsExitAmplitude);
+        float freq = Mathf.Max(0f, hapticsExitFrequency);
+
+        // 0=右, 1=左, -1=未特定
+        if (selectedHand == 0)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, dur, amp, freq);
+            _cachedHapticHand = 0; _cachedHapticBoth = false;
+            SendCustomEventDelayedSeconds(nameof(_HapticExitAgain), Mathf.Max(0.01f, doublePulseDelay));
+            return;
+        }
+        if (selectedHand == 1)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left, dur, amp, freq);
+            _cachedHapticHand = 1; _cachedHapticBoth = false;
+            SendCustomEventDelayedSeconds(nameof(_HapticExitAgain), Mathf.Max(0.01f, doublePulseDelay));
+            return;
+        }
+
+        // 未特定：評価できた側に合わせる → 無ければ両手
+        bool did = false;
+        if (evalRight)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, dur, amp, freq);
+            did = true; _cachedHapticHand = 0; _cachedHapticBoth = false;
+       }
+        if (!did && evalLeft)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left, dur, amp, freq);
+            did = true; _cachedHapticHand = 1; _cachedHapticBoth = false;
+        }
+        if (!did)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, dur, amp, freq);
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left,  dur, amp, freq);
+            _cachedHapticHand = -1; _cachedHapticBoth = true;
+        }
+        SendCustomEventDelayedSeconds(nameof(_HapticExitAgain), Mathf.Max(0.01f, doublePulseDelay));
+    }
+
+    // 解除2発目
+    public void _HapticExitAgain()
+    {
+        if (!enableExitHaptics || localPlayer == null || !localPlayer.IsUserInVR()) return;
+        float dur  = Mathf.Max(0f, hapticsExitDuration);
+        float amp  = Mathf.Clamp01(hapticsExitAmplitude);
+        float freq = Mathf.Max(0f, hapticsExitFrequency);
+
+        if (_cachedHapticBoth)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, dur, amp, freq);
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left,  dur, amp, freq);
+            return;
+        }
+        if (_cachedHapticHand == 0)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, dur, amp, freq);
+        }
+        else if (_cachedHapticHand == 1)
+        {
+            localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left, dur, amp, freq);
+        }
+    }
+
 
     // ───────────────── デバッグ ─────────────────
     public void _DebugToggleWhisper()
     {
         if (debugForced) { debugForced = false; if (isWhispering) DisableWhisper(); }
-        else             { debugForced = true;  if (!isWhispering) EnableWhisper(); }
+        else { debugForced = true; if (!isWhispering) EnableWhisper(); }
     }
     public void _DebugEnableReplyTest()
     {
         replyTestUntil = Time.time + replyTestDuration;
     }
 
-    // ───────────────── 指伸展 ─────────────────
-      private bool AreFingersExtended(bool isRight, int requiredCount)
+
+         // ───────────────── 指伸展（位置ベース） ─────────────────
+    // prox→inter と inter→dist のなす角（小さい＝真っ直ぐ＝伸展）で判定。
+    private bool AreFingersExtended(bool isRight, int requiredCount)
     {
-        float th = Mathf.Max(1f, fingerCurlThresholdDeg);
+        float th = Mathf.Clamp(fingerCurlThresholdDeg, 1f, 90f);
         int count = 0;
-        // 各指：proximal→distal の向き差（小さい＝伸び）
-        if (Vector3.Angle(
-                localPlayer.GetBoneRotation(isRight ? HumanBodyBones.RightIndexProximal  : HumanBodyBones.LeftIndexProximal)  * Vector3.forward,
-                localPlayer.GetBoneRotation(isRight ? HumanBodyBones.RightIndexDistal    : HumanBodyBones.LeftIndexDistal)     * Vector3.forward) <= th) count++;
-        if (Vector3.Angle(
-                localPlayer.GetBoneRotation(isRight ? HumanBodyBones.RightMiddleProximal : HumanBodyBones.LeftMiddleProximal) * Vector3.forward,
-                localPlayer.GetBoneRotation(isRight ? HumanBodyBones.RightMiddleDistal   : HumanBodyBones.LeftMiddleDistal)    * Vector3.forward) <= th) count++;
-        if (Vector3.Angle(
-                localPlayer.GetBoneRotation(isRight ? HumanBodyBones.RightRingProximal   : HumanBodyBones.LeftRingProximal)   * Vector3.forward,
-                localPlayer.GetBoneRotation(isRight ? HumanBodyBones.RightRingDistal     : HumanBodyBones.LeftRingDistal)      * Vector3.forward) <= th) count++;
-        if (Vector3.Angle(
-                localPlayer.GetBoneRotation(isRight ? HumanBodyBones.RightLittleProximal : HumanBodyBones.LeftLittleProximal) * Vector3.forward,
-                localPlayer.GetBoneRotation(isRight ? HumanBodyBones.RightLittleDistal   : HumanBodyBones.LeftLittleDistal)    * Vector3.forward) <= th) count++;
+        // Index
+        if (IsFingerExtendedByPose(
+                isRight ? HumanBodyBones.RightIndexProximal  : HumanBodyBones.LeftIndexProximal,
+                isRight ? HumanBodyBones.RightIndexIntermediate : HumanBodyBones.LeftIndexIntermediate,
+                isRight ? HumanBodyBones.RightIndexDistal    : HumanBodyBones.LeftIndexDistal,
+                th, isRight)) count++;
+        // Middle
+        if (IsFingerExtendedByPose(
+                isRight ? HumanBodyBones.RightMiddleProximal : HumanBodyBones.LeftMiddleProximal,
+                isRight ? HumanBodyBones.RightMiddleIntermediate : HumanBodyBones.LeftMiddleIntermediate,
+                isRight ? HumanBodyBones.RightMiddleDistal   : HumanBodyBones.LeftMiddleDistal,
+                th, isRight)) count++;
+        // Ring
+        if (IsFingerExtendedByPose(
+                isRight ? HumanBodyBones.RightRingProximal   : HumanBodyBones.LeftRingProximal,
+                isRight ? HumanBodyBones.RightRingIntermediate : HumanBodyBones.LeftRingIntermediate,
+                isRight ? HumanBodyBones.RightRingDistal     : HumanBodyBones.LeftRingDistal,
+                th, isRight)) count++;
+        // Little
+        if (IsFingerExtendedByPose(
+                isRight ? HumanBodyBones.RightLittleProximal : HumanBodyBones.LeftLittleProximal,
+                isRight ? HumanBodyBones.RightLittleIntermediate : HumanBodyBones.LeftLittleIntermediate,
+                isRight ? HumanBodyBones.RightLittleDistal   : HumanBodyBones.LeftLittleDistal,
+                th, isRight)) count++;
         return count >= Mathf.Clamp(requiredCount, 1, 4);
+    }
+
+    // 各指の曲げ角を“位置”から算出。位置が無効な場合のみ回転フォールバック。
+    private bool IsFingerExtendedByPose(HumanBodyBones prox, HumanBodyBones inter, HumanBodyBones dist, float th, bool isRight)
+    {
+        Vector3 p0 = localPlayer.GetBonePosition(prox);
+        Vector3 p1 = localPlayer.GetBonePosition(inter);
+        Vector3 p2 = localPlayer.GetBonePosition(dist);
+        bool hasPos = (p0 != Vector3.zero && p1 != Vector3.zero && p2 != Vector3.zero);
+        if (hasPos)
+        {
+            Vector3 v1 = (p1 - p0); Vector3 v2 = (p2 - p1);
+            if (v1.sqrMagnitude > 1e-6f && v2.sqrMagnitude > 1e-6f)
+            {
+                float bend = Vector3.Angle(v1, v2); // 0°に近いほど真っ直ぐ
+                return bend <= th;
+            }
+        }
+        // 回転フォールバック（旧方式）
+        Quaternion rProx = localPlayer.GetBoneRotation(prox);
+        Quaternion rDist = localPlayer.GetBoneRotation(dist);
+        float bendFallback = Vector3.Angle(rProx * Vector3.forward, rDist * Vector3.forward);
+        return bendFallback <= th;
     }
 }
