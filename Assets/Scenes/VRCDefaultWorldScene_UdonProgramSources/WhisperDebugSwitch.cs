@@ -11,6 +11,5 @@ public class WhisperDebugSwitch : UdonSharpBehaviour
     {
         if (target == null) return;
         target._DebugToggleWhisper();
-        target._DebugEnableReplyTest();
     }
 }

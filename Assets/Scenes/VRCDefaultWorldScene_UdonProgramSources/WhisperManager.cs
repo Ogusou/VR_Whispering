@@ -1,12 +1,25 @@
-﻿using UdonSharp;
+using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
 using VRC.Udon;
 using TMPro;
 using UnityEngine.UI;
 
+/// <summary>
+/// WhisperManager
+/// 役割：
+///  - 『話し手（ローカル）』の囁き判定
+///  - 音声距離の切替／ローカルFX（ビネット・アイコン・ハプティクス・ダッキング）
+///  - 受信安定性チェック（耳の区別なし：near = min(dR,dL) を debug.log & ReplyLabel に表示）
+///  - ネットワーク通知や『被囁き（リスナー）側の表示』は WhisperReply/WhisperRelay に委譲
+/// </summary>
 public class WhisperManager : UdonSharpBehaviour
 {
+    // ───────── 依存（ネットワーク配信は別コンポーネントへ） ─────────
+    [Header("Relay (optional)")]
+    [Tooltip("WhisperReply/WhisperRelay を指定すると、囁き開始/継続/終了で TalkerEnter/TalkerTick/TalkerExit を呼びます")]
+    public UdonBehaviour reply; // WhisperRelay 側に public メソッド名 "TalkerEnter/ TalkerTick/ TalkerExit" を用意
+
     // ───────── 基本設定 ─────────
     [Header("距離しきい値 (m)")]
     public float selfEarThreshold = 0.12f;
@@ -52,9 +65,12 @@ public class WhisperManager : UdonSharpBehaviour
     public TextMeshProUGUI distanceLabel;
     public TextMeshProUGUI orientLabel;
     public TextMeshProUGUI fingerLabel;
-    public TextMeshProUGUI assistLabel;
-    public TextMeshProUGUI replyLabel;
+    public TextMeshProUGUI profileLabel;
     public TextMeshProUGUI stateLabel;
+
+    [Header("Reply Label（受信安定性の表示用：どちらか片方でOK）")]
+    public TextMeshProUGUI replyLabelTMP;
+    public Text replyLabelUGUI;
 
     [Header("背景/効果音（任意）")]
     public Image whisperBgImage;
@@ -75,7 +91,7 @@ public class WhisperManager : UdonSharpBehaviour
     [Tooltip("グリップ押下と判定するしきい値（0〜1）")]
     public float gripPressThreshold = 0.8f;
     private bool _prevGripR = false, _prevGripL = false;
-    private int _selectedHand = -1;
+    private int _selectedHand = -1; // 0=Right,1=Left,-1=Auto
 
     // ───────── Whisper FX（見た目：ビネット）─────────
     [Header("Whisper FX - Vignette (ローカル画面の周辺暗転)")]
@@ -90,6 +106,7 @@ public class WhisperManager : UdonSharpBehaviour
     [Range(0f, 1f)] public float vignetteExitAlpha = 0.0f;
     public float vignetteFadeInTime = 0.20f;
     public float vignetteFadeOutTime = 0.15f;
+    public Color talkerVignetteTint   = new Color(1f, 0.55f, 0.55f, 1f); // 話し手色
 
     // ───────── Whisper FX（見た目：手首LED）─────────
     [Header("Whisper FX - 手首LED（エミッシブ点灯）")]
@@ -108,18 +125,15 @@ public class WhisperManager : UdonSharpBehaviour
     [Tooltip("左下に出す囁き中アイコン（Sprite を割当）")]
     public Image whisperIconImage;
     public RectTransform whisperIconRect;     // = whisperIconImage.rectTransform を割当
-
     [Tooltip("視線基準のローカルオフセット[m]（左下は x<0, y<0）")]
     public Vector2 iconOffsetMeters = new Vector2(-0.10f, -0.06f);
     [Tooltip("アイコンの見かけサイズ[m]")]
     public Vector2 iconSizeMeters = new Vector2(0.05f, 0.05f);
-
     [Range(0f, 1f)] public float iconEnterAlpha = 1f;
     [Range(0f, 1f)] public float iconExitAlpha = 0f;
     [Tooltip("フェードイン/アウト(秒)")]
     public float iconFadeInTime = 0.20f;
     public float iconFadeOutTime = 0.15f;
-
 
     // ───────── Haptics ─────────
     [Header("Haptics (Whisper Enter)")]
@@ -151,6 +165,13 @@ public class WhisperManager : UdonSharpBehaviour
     public int minExtendedFingersEnter = 4;
     public int minExtendedFingersExit = 3;
 
+    // 追加：指伸展 検出オプション（誤検出対策）
+    [Tooltip("指ボーン位置が取れない場合に回転フォールバックで代用するか（誤検出が出る場合はOFF推奨）")]
+    public bool fingerUseRotationFallback = false;
+
+    [Tooltip("位置ベース判定で使う各指セグメントの最小長[m]。これ未満なら無効指として扱う")]
+    public float fingerMinSegmentLen = 0.01f;
+
     [Header("モード判定（しきい値切替）")]
     public bool enableModeDetection = false;
     public float coverDotSignedThresh = 0.35f;
@@ -160,11 +181,6 @@ public class WhisperManager : UdonSharpBehaviour
     public float fixedDotMin = 0.45f;
     public float fixedDotMax = 0.70f;
     public float fixedDyRawMin = 0.09f;
-
-    [Header("返答モード（口元近接のみ・実験用）")]
-    public bool enableReplyLax = true;
-    public float replyNearThreshold = 0.22f;
-    public float replyTestDuration = 10f;
 
     [Header("デバッグ：キューブ Interact でトグル")]
     public bool interactToToggle = false;
@@ -191,12 +207,29 @@ public class WhisperManager : UdonSharpBehaviour
     [Tooltip("囁きを解除するときの戻し時間(秒)")]
     public float duckFadeOutTime = 0.20f;
 
+    // ───────── 受信安定性（耳の区別なし）─────────
+    [Header("受信安定性（near = min(dR,dL)）")]
+    [Tooltip("受信開始（これ以下でON候補）")]
+    public float enterDistance = 0.40f;
+    [Tooltip("受信終了（これ以上でOFF候補）")]
+    public float exitDistance = 0.50f;
 
-    // ───────── 内部状態 ─────────
+    [Header("安定化パラメータ")]
+    [Tooltip("ON/OFFに遷移させるのに必要な連続一致回数")]
+    public int confirmCount = 3;
+    [Tooltip("最後のPingからのタイムアウト秒数（超えたら停止扱い）")]
+    public float pingTimeoutSec = 1.5f;
+
+    private const string LOG = "[WhisperCheck]";
+    private bool isReceiving;
+    private int stableCounter;
+    private int unstableCounter;
+    private float lastPingTime;
+
+    // ───────── 内部状態（ローカルのみ） ─────────
     private VRCPlayerApi localPlayer;
     private bool isWhispering;
     private bool debugForced = false;
-    private float replyTestUntil = 0f;
 
     // Ducking 内部状態
     private float[] _duckOrigVol;
@@ -207,11 +240,13 @@ public class WhisperManager : UdonSharpBehaviour
 
     // ビネット/LED の内部状態
     private float _vigAlpha = 0f, _vigTarget = 0f;
-    // FX 内部状態
+
+    // アイコン/LED の内部状態
     private float _iconAlpha = 0f, _iconTarget = 0f;
     private float _ledIntensity = 0f, _ledTarget = 0f;
     private MaterialPropertyBlock _mpbLed;
 
+    // ───────── ライフサイクル ─────────
     void Start()
     {
         localPlayer = Networking.LocalPlayer;
@@ -235,13 +270,19 @@ public class WhisperManager : UdonSharpBehaviour
             _ledTarget = enableWristLed ? wristLedOffIntensity : 0f; // 無効時は常に0
             _ApplyWristLed();
         }
-        // Vignette 初期化（非表示）の直後あたりに追加
+
+        UpdateLabel("受信: 未判定");
+        Debug.Log($"{LOG} init enter={enterDistance:F2} exit={exitDistance:F2} confirm={confirmCount} timeout={pingTimeoutSec:F1}");
+
+        // 囁きアイコン初期化
         if (whisperIconImage != null)
         {
             var c = whisperIconImage.color; c.a = 0f;
             whisperIconImage.color = c;
             _iconAlpha = 0f; _iconTarget = 0f;
         }
+
+        // Ducking 初期化
         if (duckTargets != null && duckTargets.Length > 0)
         {
             int n = duckTargets.Length;
@@ -257,7 +298,6 @@ public class WhisperManager : UdonSharpBehaviour
 
                 _duckOrigVol[i] = a.volume;
 
-                // 事前に各 AudioSource に AudioLowPassFilter を付けておくと効果的（Udonで新規追加は不可）
                 var lpf = a.GetComponent<AudioLowPassFilter>();
                 _duckLPF[i] = lpf;
                 if (lpf != null)
@@ -267,54 +307,21 @@ public class WhisperManager : UdonSharpBehaviour
                 }
             }
         }
-
     }
 
     public override void Interact()
     {
         if (!interactToToggle) return;
         _DebugToggleWhisper();
-        _DebugEnableReplyTest();
     }
 
     void Update()
     {
         if (localPlayer == null) return;
 
-        // デバッグ強制 ON
-        if (debugForced)
-        {
-            if (!isWhispering)
-            {
-                EnableWhisper();
-                TriggerEnterHaptics(_selectedHand, true, true);
-            }
-
-            // デバッグ強制ブロック内の毎フレーム処理に追加
-            _TickVignetteFade();
-            _TickIconFade();
-            _TickWristLedFade();
-            _TickVignetteTransform();
-            _TickIconTransform();
-            _TickDuck();
-
-            UpdateBoolTMP(distanceLabel, true, "距離");
-            UpdateBoolTMP(fingerLabel, true, "指");
-            if (orientLabel != null) orientLabel.text = "掌向き: Debug";
-            if (assistLabel != null)
-            {
-                float remain = Mathf.Max(0f, replyTestUntil - Time.time);
-                assistLabel.text = "Hands:" + (activeHandsMode == 0 ? "Right" : activeHandsMode == 1 ? "Left" : "Both")
-                                 + "  ModeDet:" + (enableModeDetection ? "ON" : "OFF")
-                                 + "  ReplyTest " + (remain > 0f ? ("ON " + remain.ToString("F1") + "s") : "OFF");
-            }
-            if (replyLabel != null) replyLabel.text = "Debug Forced ON";
-            return;
-        }
-
-        // 手の選択
+        // 手の選択（初期状態）
         bool evalRight = (activeHandsMode != 1);
-        bool evalLeft = (activeHandsMode != 0);
+        bool evalLeft  = (activeHandsMode != 0);
 
         // グリップで手選択（両手モードのみ）
         if (enableGripSwitch && activeHandsMode == 2 && localPlayer.IsUserInVR())
@@ -329,11 +336,44 @@ public class WhisperManager : UdonSharpBehaviour
 
             if (rDown && !lDown) _selectedHand = 0;
             else if (lDown && !rDown) _selectedHand = 1;
-            else if (rDown && lDown) _selectedHand = 0;
+            else if (rDown && lDown) _selectedHand = 0; // 同時押しは右優先
 
-            if (_selectedHand == 0) { evalRight = true; evalLeft = false; }
-            else if (_selectedHand == 1) { evalRight = false; evalLeft = true; }
-            else { evalRight = false; evalLeft = false; }
+            if (_selectedHand == 0) { evalRight = true;  evalLeft = false; }
+            else if (_selectedHand == 1) { evalRight = false; evalLeft = true;  }
+        }
+
+        // デバッグ強制 ON（見た目等だけ動かす）
+        if (debugForced)
+        {
+            if (!isWhispering)
+            {
+                EnableWhisper();
+                TriggerEnterHaptics(_selectedHand, true, true);
+            }
+
+            _TickVignetteFade();
+            _TickIconFade();
+            _TickWristLedFade();
+            _TickVignetteTransform();
+            _TickIconTransform();
+            _TickDuck();
+
+            UpdateBoolTMP(distanceLabel, true, "距離");
+            UpdateBoolTMP(fingerLabel, true, "指");
+            if (orientLabel != null) orientLabel.text = "掌向き: Debug";
+
+            // プロファイル表示（常時更新）
+            UpdateProfileLabel(evalRight, evalLeft, true, true);
+
+            // 受信タイムアウト監視（デバッグ中も動かす）
+            if (isReceiving && (Time.time - lastPingTime) > pingTimeoutSec)
+            {
+                isReceiving = false;
+                stableCounter = 0;
+                Debug.Log($"{LOG} RECV_STOP reason=timeout");
+                UpdateLabel("受信: ❌ (timeout)");
+            }
+            return;
         }
 
         // 手ごとの評価
@@ -341,68 +381,43 @@ public class WhisperManager : UdonSharpBehaviour
         float rDot = 0f, lDot = 0f, rDy = 0f, lDy = 0f;
 
         bool loosened = useExitLoosenedThresholds && isWhispering;
-        if (evalRight) rOK = EvaluateHand(true, loosened, out rDot, out rDy, out rOrient);
-        if (evalLeft) lOK = EvaluateHand(false, loosened, out lDot, out lDy, out lOrient);
+        if (evalRight) rOK = EvaluateHand(true,  loosened, out rDot, out rDy, out rOrient);
+        if (evalLeft)  lOK = EvaluateHand(false, loosened, out lDot, out lDy, out lOrient);
 
         bool anyWhisper = rOK || lOK;
 
         // 表示（代表手）
         bool useRight = rOK ? true : (lOK ? false : (evalRight && !evalLeft));
         float showDot = useRight ? rDot : lDot;
-        float showDyRaw = useRight ? rDy : lDy;
+        float showDy = useRight ? rDy : lDy;
         bool showOrientOK = useRight ? rOrient : lOrient;
 
         if (orientLabel != null)
             orientLabel.text = "掌向き" + (loosened ? "(Exit)" : "(Enter)") + ": " + (showOrientOK ? "OK" : "NG") +
                                "  dot=" + showDot.ToString("F2") +
-                               "  dy=" + showDyRaw.ToString("F2") + "m" +
+                               "  dy=" + showDy.ToString("F2") + "m" +
                                (enableModeDetection
                                  ? $"  (dot≥{coverDotSignedThresh:F2}, dyNorm≥{dyNormThresh:F2})"
                                  : $"  (dot {fixedDotMin:F2}–{fixedDotMax:F2}, dy≥{fixedDyRawMin:F2})");
 
-        // 返答モード
-        bool replyActive = enableReplyLax && (Time.time < replyTestUntil);
-        bool replyR = false, replyL = false;
-        if (replyActive)
-        {
-            VRCPlayerApi dummy;
-            if (evalRight) replyR = IsReplyLaxOK(true, out dummy);
-            if (evalLeft) replyL = IsReplyLaxOK(false, out dummy);
-        }
-        bool replyAny = replyR || replyL;
-        if (replyLabel != null)
-        {
-            replyLabel.text = "Reply: " + (replyActive ? "ON" : "OFF") +
-                              " near=" + replyNearThreshold.ToString("F2") +
-                              " R=" + (replyR ? "Y" : "n") +
-                              " L=" + (replyL ? "Y" : "n");
-        }
-
-        if (assistLabel != null)
-        {
-            string selStr = (_selectedHand < 0) ? "None" : (_selectedHand == 0 ? "Right" : "Left");
-            string gripStr = (_prevGripR ? "R" : "-") + "/" + (_prevGripL ? "L" : "-");
-            assistLabel.text = "Hands:" + (activeHandsMode == 0 ? "Right" : activeHandsMode == 1 ? "Left" : "Both")
-                             + "  ModeDet:" + (enableModeDetection ? "ON" : "OFF")
-                             + "  Sel:" + selStr
-                             + "  Grip:" + gripStr;
-        }
-
-        bool shouldWhisper = anyWhisper || replyAny;
-        if (shouldWhisper && !isWhispering)
+        // 囁き状態の切り替え
+        if (anyWhisper && !isWhispering)
         {
             EnableWhisper();
             int hapticHand = (_selectedHand >= 0) ? _selectedHand : (useRight ? 0 : 1);
             TriggerEnterHaptics(hapticHand, evalRight, evalLeft);
         }
-        else if (!shouldWhisper && isWhispering)
+        else if (!anyWhisper && isWhispering)
         {
             DisableWhisper();
             int hapticHand = (_selectedHand >= 0) ? _selectedHand : (evalRight ? 0 : (evalLeft ? 1 : 0));
             TriggerExitHaptics(hapticHand, evalRight, evalLeft);
         }
 
-        // FX
+        // ネットワーク配信（WhisperRelay に委譲）
+        if (isWhispering && reply != null) reply.SendCustomEvent("TalkerTick");
+
+        // FX 更新
         _TickVignetteFade();
         _TickIconFade();
         _TickWristLedFade();
@@ -410,6 +425,17 @@ public class WhisperManager : UdonSharpBehaviour
         _TickIconTransform();
         _TickDuck();
 
+        // プロファイル表示（常時更新）
+        UpdateProfileLabel(evalRight, evalLeft, rOK, lOK);
+
+        // Pingが途切れたら停止扱い（受信安定性）
+        if (isReceiving && (Time.time - lastPingTime) > pingTimeoutSec)
+        {
+            isReceiving = false;
+            stableCounter = 0;
+            Debug.Log($"{LOG} RECV_STOP reason=timeout");
+            UpdateLabel("受信: ❌ (timeout)");
+        }
     }
 
     // ───────────────── 判定ひとまとめ ─────────────────
@@ -495,26 +521,22 @@ public class WhisperManager : UdonSharpBehaviour
             }
         }
     }
-    // 返答モード：口元近接のみ（ゆる条件）
-    private bool IsReplyLaxOK(bool isRight, out VRCPlayerApi target)
+
+    private bool IsOtherDistanceWithThreshold(VRCPlayerApi other, bool isRight, float threshold)
     {
-        // 近い相手（手首から最も近い頭）を取得
-        target = FindNearestAny(isRight);
-        if (target == null) return false;
-
-        // 口の推定位置（頭ボーン基準）
-        Vector3 headPos = target.GetBonePosition(HumanBodyBones.Head);
-        Quaternion headRot = target.GetBoneRotation(HumanBodyBones.Head);
-        Vector3 mouthPos = headPos + headRot * new Vector3(0f, -0.07f, 0.10f);
-
-        // 自分の該当手の手首位置
+        if (debugPassOtherDistance) return true;
+        if (other == null) return false;
         Vector3 wrist = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
-
-        // 手首と口の距離が閾値未満なら返答モード成立
-        float d = Vector3.Distance(wrist, mouthPos);
-        return d < replyNearThreshold;
+        Vector3 head = other.GetBonePosition(HumanBodyBones.Head);
+        return Vector3.Distance(wrist, head) < threshold;
     }
 
+    private bool IsHandNearHead(VRCPlayerApi target, float threshold, bool isRight)
+    {
+        Vector3 headPos = target.GetBonePosition(HumanBodyBones.Head);
+        Vector3 wristPos = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
+        return Vector3.Distance(headPos, wristPos) < threshold;
+    }
 
     // ── dyRaw を取得（優先度：指ボーン→掌ベース指方向→手軸フォールバック）
     private float ComputeDyRaw(bool isRight)
@@ -547,9 +569,9 @@ public class WhisperManager : UdonSharpBehaviour
     private Vector3 ComputePalmNormal(bool isRight)
     {
         Vector3 wrist = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
-        Vector3 idxP = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightIndexProximal : HumanBodyBones.LeftIndexProximal);
-        Vector3 litP = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightLittleProximal : HumanBodyBones.LeftLittleProximal);
-        Vector3 midP = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightMiddleProximal : HumanBodyBones.LeftMiddleProximal);
+        Vector3 idxP  = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightIndexProximal  : HumanBodyBones.LeftIndexProximal);
+        Vector3 litP  = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightLittleProximal : HumanBodyBones.LeftLittleProximal);
+        Vector3 midP  = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightMiddleProximal : HumanBodyBones.LeftMiddleProximal);
 
         if (wrist == Vector3.zero || idxP == Vector3.zero || litP == Vector3.zero || midP == Vector3.zero)
             return ComputePalmNormalFallback(isRight);
@@ -574,65 +596,68 @@ public class WhisperManager : UdonSharpBehaviour
         return (n.sqrMagnitude < 1e-6f) ? Vector3.forward : n.normalized;
     }
 
-    // ───────────────── 補助 ─────────────────
-    private float GetDyNorm(float dyRaw, bool isRight)
+    // ───────────────── 指伸展（位置ベース） ─────────────────
+    private bool AreFingersExtended(bool isRight, int requiredCount)
     {
-        Vector3 wrist = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
-        Vector3 fore = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightLowerArm : HumanBodyBones.LeftLowerArm);
-        float refLen = (wrist != Vector3.zero && fore != Vector3.zero) ? Vector3.Distance(wrist, fore) : 0.11f;
-        if (refLen < 0.07f) refLen = 0.11f;
-        float n = dyRaw / refLen; if (n < 0f) n = 0f; if (n > 1.5f) n = 1.5f;
-        return n;
+        float th = Mathf.Clamp(fingerCurlThresholdDeg, 1f, 90f);
+        int count = 0;
+        if (IsFingerExtendedByPose(
+            isRight ? HumanBodyBones.RightIndexProximal : HumanBodyBones.LeftIndexProximal,
+            isRight ? HumanBodyBones.RightIndexIntermediate : HumanBodyBones.LeftIndexIntermediate,
+            isRight ? HumanBodyBones.RightIndexDistal : HumanBodyBones.LeftIndexDistal, th, isRight)) count++;
+
+        if (IsFingerExtendedByPose(
+            isRight ? HumanBodyBones.RightMiddleProximal : HumanBodyBones.LeftMiddleProximal,
+            isRight ? HumanBodyBones.RightMiddleIntermediate : HumanBodyBones.LeftMiddleIntermediate,
+            isRight ? HumanBodyBones.RightMiddleDistal : HumanBodyBones.LeftMiddleDistal, th, isRight)) count++;
+
+        if (IsFingerExtendedByPose(
+            isRight ? HumanBodyBones.RightRingProximal : HumanBodyBones.LeftRingProximal,
+            isRight ? HumanBodyBones.RightRingIntermediate : HumanBodyBones.LeftRingIntermediate,
+            isRight ? HumanBodyBones.RightRingDistal : HumanBodyBones.LeftRingDistal, th, isRight)) count++;
+
+        if (IsFingerExtendedByPose(
+            isRight ? HumanBodyBones.RightLittleProximal : HumanBodyBones.LeftLittleProximal,
+            isRight ? HumanBodyBones.RightLittleIntermediate : HumanBodyBones.LeftLittleIntermediate,
+            isRight ? HumanBodyBones.RightLittleDistal : HumanBodyBones.LeftLittleDistal, th, isRight)) count++;
+
+        bool ok = count >= Mathf.Clamp(requiredCount, 1, 4);
+
+        if (fingerLabel != null)
+            fingerLabel.text = $"指({(isRight ? "R" : "L")}): {count}/{Mathf.Clamp(requiredCount,1,4)}";
+
+        return ok;
     }
 
-    private bool IsOtherDistanceWithThreshold(VRCPlayerApi other, bool isRight, float threshold)
+    private bool IsFingerExtendedByPose(HumanBodyBones prox, HumanBodyBones inter, HumanBodyBones dist, float th, bool isRight)
     {
-        if (debugPassOtherDistance) return true;
-        if (other == null) return false;
-        Vector3 wrist = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
-        Vector3 head = other.GetBonePosition(HumanBodyBones.Head);
-        return Vector3.Distance(wrist, head) < threshold;
-    }
+        Vector3 p0 = localPlayer.GetBonePosition(prox);
+        Vector3 p1 = localPlayer.GetBonePosition(inter);
+        Vector3 p2 = localPlayer.GetBonePosition(dist);
 
-    private bool IsHandNearHead(VRCPlayerApi target, float threshold, bool isRight)
-    {
-        Vector3 headPos = target.GetBonePosition(HumanBodyBones.Head);
-        Vector3 wristPos = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
-        return Vector3.Distance(headPos, wristPos) < threshold;
-    }
+        float minLen2 = fingerMinSegmentLen * fingerMinSegmentLen;
+        bool segOK = (p0 != Vector3.zero && p1 != Vector3.zero && p2 != Vector3.zero)
+                     && ((p1 - p0).sqrMagnitude >= minLen2) && ((p2 - p1).sqrMagnitude >= minLen2);
 
-    private Vector3 GetValidFingerTip(bool isRight, out bool valid)
-    {
-        Vector3 wrist = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
-
-        Vector3 tip = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightMiddleDistal : HumanBodyBones.LeftMiddleDistal);
-        if (tip != Vector3.zero && (tip - wrist).sqrMagnitude > 1e-5f) { valid = true; return tip; }
-
-        tip = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightIndexDistal : HumanBodyBones.LeftIndexDistal);
-        if (tip != Vector3.zero && (tip - wrist).sqrMagnitude > 1e-5f) { valid = true; return tip; }
-
-        tip = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightMiddleIntermediate : HumanBodyBones.LeftMiddleIntermediate);
-        if (tip != Vector3.zero && (tip - wrist).sqrMagnitude > 1e-5f) { valid = true; return tip; }
-
-        tip = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightIndexIntermediate : HumanBodyBones.LeftIndexIntermediate);
-        if (tip != Vector3.zero && (tip - wrist).sqrMagnitude > 1e-5f) { valid = true; return tip; }
-
-        valid = false; return Vector3.zero;
-    }
-
-    private VRCPlayerApi FindNearestAny(bool isRight)
-    {
-        VRCPlayerApi[] list = new VRCPlayerApi[VRCPlayerApi.GetPlayerCount()];
-        VRCPlayerApi.GetPlayers(list);
-        Vector3 wrist = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
-        float min = 1e9f; VRCPlayerApi best = null;
-        foreach (var p in list)
+        if (segOK)
         {
-            if (p == null || !p.IsValid() || p.isLocal) continue;
-            float dist = Vector3.Distance(wrist, p.GetBonePosition(HumanBodyBones.Head));
-            if (dist < min) { min = dist; best = p; }
+            Vector3 v1 = (p1 - p0);
+            Vector3 v2 = (p2 - p1);
+            float bend = Vector3.Angle(v1, v2); // 0°に近いほど真っ直ぐ
+            return bend <= th;
         }
-        return best;
+
+        if (!fingerUseRotationFallback) return false;
+
+        Quaternion rProx = localPlayer.GetBoneRotation(prox);
+        Quaternion rDist = localPlayer.GetBoneRotation(dist);
+
+        Vector3 f0 = rProx * Vector3.forward;
+        Vector3 f1 = rDist * Vector3.forward;
+        if (f0.sqrMagnitude < 1e-6f || f1.sqrMagnitude < 1e-6f) return false;
+
+        float bendFallback = Vector3.Angle(f0, f1);
+        return bendFallback <= th;
     }
 
     // ───────────────── 音声制御 & UI ─────────────────
@@ -646,11 +671,24 @@ public class WhisperManager : UdonSharpBehaviour
 
         if (whisperBgImage != null) whisperBgImage.color = whisperBgColor;
         if (sfxSource != null && sfxEnterWhisper != null) sfxSource.PlayOneShot(sfxEnterWhisper, sfxEnterVolume);
+
+        // 話し手のビネット色（RGB）適用（アルファはフェーダで）
+        if (vignetteImage != null)
+        {
+            var c = vignetteImage.color;
+            c.r = talkerVignetteTint.r; c.g = talkerVignetteTint.g; c.b = talkerVignetteTint.b;
+            vignetteImage.color = c;
+        }
+
         _iconTarget = iconEnterAlpha;
         _vigTarget = vignetteEnterAlpha;
         _ledTarget = enableWristLed ? wristLedOnIntensity : 0f;
-        _duckTarget = 1f;   // 入ったらダック
 
+        // ダッキング（話し手）
+        _duckTarget = 1f;
+
+        // ネットワーク配信（WhisperRelay に委譲）
+        if (reply != null) reply.SendCustomEvent("TalkerEnter");
     }
 
     private void DisableWhisper()
@@ -666,8 +704,11 @@ public class WhisperManager : UdonSharpBehaviour
 
         _vigTarget = vignetteExitAlpha;
         _iconTarget = iconExitAlpha;
-        _ledTarget = 0f; // 無効時も含め解除は必ず消灯
-        _duckTarget = 0f;   // 解除で戻す
+        _ledTarget = 0f;
+        _duckTarget = 0f;
+
+        // ネットワーク配信（WhisperRelay に委譲）
+        if (reply != null) reply.SendCustomEvent("TalkerExit");
     }
 
     private void UpdateBoolTMP(TextMeshProUGUI tmp, bool ok, string label)
@@ -682,6 +723,16 @@ public class WhisperManager : UdonSharpBehaviour
         stateLabel.text = on ? "Whispering" : "Normal";
     }
 
+    private void UpdateProfileLabel(bool evalRight, bool evalLeft, bool rActive, bool lActive)
+    {
+        if (profileLabel == null) return;
+        string mode = (activeHandsMode == 0) ? "Right" : (activeHandsMode == 1) ? "Left" : "Both";
+        string sel  = (_selectedHand == 0) ? "Right" : (_selectedHand == 1) ? "Left" : "Auto";
+        string enabled = $"R:{(evalRight ? "ON" : "off")}  L:{(evalLeft ? "ON" : "off")}";
+        string active  = $"R:{(rActive ? "●" : "・")}  L:{(lActive ? "●" : "・")}";
+        profileLabel.text = $"Hands:{mode}  Enabled[{enabled}]  Active[{active}]  Select:{sel}";
+    }
+
     // ───────── FX（ビネット）─────────
     private void _TickVignetteFade()
     {
@@ -692,14 +743,16 @@ public class WhisperManager : UdonSharpBehaviour
         var c = vignetteImage.color; c.a = _vigAlpha; vignetteImage.color = c;
     }
 
-    // 頭に固定＆メートル指定サイズにスケーリング
+    // 頭に固定＆メートル指定サイズにスケーリング（耳寄せはリスナー側でのみ行うためここではセンター固定）
     private void _TickVignetteTransform()
     {
         if (vignetteRect == null || localPlayer == null) return;
         var td = localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.Head);
-        Vector3 pos = td.position + td.rotation * (Vector3.forward * vignetteDistance);
+
+        Vector3 planeCenter = td.position + td.rotation * (Vector3.forward * vignetteDistance);
         Quaternion rot = td.rotation * Quaternion.Euler(0f, 180f, 0f);
-        vignetteRect.SetPositionAndRotation(pos, rot);
+
+        vignetteRect.SetPositionAndRotation(planeCenter, rot);
 
         Vector2 px = vignetteRect.sizeDelta;
         if (px.x < 1f) px = new Vector2(1024f, 1024f);
@@ -713,44 +766,38 @@ public class WhisperManager : UdonSharpBehaviour
     {
         if (whisperIconImage == null) return;
         float dur = (_iconTarget > _iconAlpha) ? Mathf.Max(0.01f, iconFadeInTime)
-                                                : Mathf.Max(0.01f, iconFadeOutTime);
+                                               : Mathf.Max(0.01f, iconFadeOutTime);
         float step = Time.deltaTime / dur;
         _iconAlpha = Mathf.MoveTowards(_iconAlpha, _iconTarget, step);
         var c = whisperIconImage.color; c.a = _iconAlpha; whisperIconImage.color = c;
     }
 
-    // アイコンのヘッドロック配置（ビネットと同じ平面に、ローカル左下オフセット）
+    // アイコンのヘッドロック配置
     private void _TickIconTransform()
     {
         if (whisperIconRect == null || localPlayer == null) return;
 
         var td = localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.Head);
 
-        // ビネットと同じ距離（vignetteDistance）へ出し、左下にオフセット
         Vector3 planeCenter = td.position + td.rotation * (Vector3.forward * vignetteDistance);
         Vector3 localOffset = new Vector3(iconOffsetMeters.x, iconOffsetMeters.y, 0f);
         Vector3 pos = planeCenter + td.rotation * localOffset;
 
-        // 180°回転で正面向きの画像を表に（ビネットと同じ）
         Quaternion rot = td.rotation * Quaternion.Euler(0f, 180f, 0f);
         whisperIconRect.SetPositionAndRotation(pos, rot);
 
-        // 「何mで見せたいか」ベースのスケール
         Vector2 px = whisperIconRect.sizeDelta;
-        if (px.x < 1f) px = new Vector2(256f, 256f); // 念のための仮値
+        if (px.x < 1f) px = new Vector2(256f, 256f);
         float sx = iconSizeMeters.x / px.x;
         float sy = iconSizeMeters.y / px.y;
         whisperIconRect.localScale = new Vector3(sx, sy, 1f);
     }
 
-
     // ───────── FX（手首LED）─────────
     private void _TickWristLedFade()
     {
-        // レンダラ未設定なら何もしない
         if (wristLedRenderer == null) return;
 
-        // 機能無効時：常に0へフェードして消灯維持
         if (!enableWristLed)
         {
             if (_ledIntensity > 0f)
@@ -762,7 +809,6 @@ public class WhisperManager : UdonSharpBehaviour
             return;
         }
 
-        // 有効時はターゲットへフェード
         float dur = (_ledTarget > _ledIntensity) ? Mathf.Max(0.01f, wristLedFadeInTime)
                                                  : Mathf.Max(0.01f, wristLedFadeOutTime);
         float step = Time.deltaTime / dur;
@@ -776,7 +822,6 @@ public class WhisperManager : UdonSharpBehaviour
         if (_mpbLed == null) _mpbLed = new MaterialPropertyBlock();
         wristLedRenderer.GetPropertyBlock(_mpbLed);
 
-        // EmissionColor が無いシェーダでも _Color 側へも書いておく
         Color emit = wristLedColor * Mathf.Max(0f, _ledIntensity);
         _mpbLed.SetColor("_EmissionColor", emit);
         _mpbLed.SetColor("_Color", new Color(wristLedColor.r, wristLedColor.g, wristLedColor.b, 1f));
@@ -878,59 +923,116 @@ public class WhisperManager : UdonSharpBehaviour
         }
     }
 
-    public void _DebugEnableReplyTest()
+    // ───────────────── 補助 ─────────────────
+    private Vector3 GetValidFingerTip(bool isRight, out bool valid)
     {
-        replyTestUntil = Time.time + replyTestDuration;
+        Vector3 wrist = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
+
+        Vector3 tip = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightMiddleDistal : HumanBodyBones.LeftMiddleDistal);
+        if (tip != Vector3.zero && (tip - wrist).sqrMagnitude > 1e-5f) { valid = true; return tip; }
+
+        tip = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightIndexDistal : HumanBodyBones.LeftIndexDistal);
+        if (tip != Vector3.zero && (tip - wrist).sqrMagnitude > 1e-5f) { valid = true; return tip; }
+
+        tip = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightMiddleIntermediate : HumanBodyBones.LeftMiddleIntermediate);
+        if (tip != Vector3.zero && (tip - wrist).sqrMagnitude > 1e-5f) { valid = true; return tip; }
+
+        tip = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightIndexIntermediate : HumanBodyBones.LeftIndexIntermediate);
+        if (tip != Vector3.zero && (tip - wrist).sqrMagnitude > 1e-5f) { valid = true; return tip; }
+
+        valid = false; return Vector3.zero;
     }
 
-    // ───────────────── 指伸展（位置ベース） ─────────────────
-    private bool AreFingersExtended(bool isRight, int requiredCount)
+    private VRCPlayerApi FindNearestAny(bool isRight)
     {
-        float th = Mathf.Clamp(fingerCurlThresholdDeg, 1f, 90f);
-        int count = 0;
-        if (IsFingerExtendedByPose(
-            isRight ? HumanBodyBones.RightIndexProximal : HumanBodyBones.LeftIndexProximal,
-            isRight ? HumanBodyBones.RightIndexIntermediate : HumanBodyBones.LeftIndexIntermediate,
-            isRight ? HumanBodyBones.RightIndexDistal : HumanBodyBones.LeftIndexDistal, th, isRight)) count++;
-
-        if (IsFingerExtendedByPose(
-            isRight ? HumanBodyBones.RightMiddleProximal : HumanBodyBones.LeftMiddleProximal,
-            isRight ? HumanBodyBones.RightMiddleIntermediate : HumanBodyBones.LeftMiddleIntermediate,
-            isRight ? HumanBodyBones.RightMiddleDistal : HumanBodyBones.LeftMiddleDistal, th, isRight)) count++;
-
-        if (IsFingerExtendedByPose(
-            isRight ? HumanBodyBones.RightRingProximal : HumanBodyBones.LeftRingProximal,
-            isRight ? HumanBodyBones.RightRingIntermediate : HumanBodyBones.LeftRingIntermediate,
-            isRight ? HumanBodyBones.RightRingDistal : HumanBodyBones.LeftRingDistal, th, isRight)) count++;
-
-        if (IsFingerExtendedByPose(
-            isRight ? HumanBodyBones.RightLittleProximal : HumanBodyBones.LeftLittleProximal,
-            isRight ? HumanBodyBones.RightLittleIntermediate : HumanBodyBones.LeftLittleIntermediate,
-            isRight ? HumanBodyBones.RightLittleDistal : HumanBodyBones.LeftLittleDistal, th, isRight)) count++;
-
-        return count >= Mathf.Clamp(requiredCount, 1, 4);
-    }
-
-    private bool IsFingerExtendedByPose(HumanBodyBones prox, HumanBodyBones inter, HumanBodyBones dist, float th, bool isRight)
-    {
-        Vector3 p0 = localPlayer.GetBonePosition(prox);
-        Vector3 p1 = localPlayer.GetBonePosition(inter);
-        Vector3 p2 = localPlayer.GetBonePosition(dist);
-        bool hasPos = (p0 != Vector3.zero && p1 != Vector3.zero && p2 != Vector3.zero);
-        if (hasPos)
+        VRCPlayerApi[] list = new VRCPlayerApi[VRCPlayerApi.GetPlayerCount()];
+        VRCPlayerApi.GetPlayers(list);
+        Vector3 wrist = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
+        float min = 1e9f; VRCPlayerApi best = null;
+        foreach (var p in list)
         {
-            Vector3 v1 = (p1 - p0);
-            Vector3 v2 = (p2 - p1);
-            if (v1.sqrMagnitude > 1e-6f && v2.sqrMagnitude > 1e-6f)
+            if (p == null || !p.IsValid() || p.isLocal) continue;
+            float dist = Vector3.Distance(wrist, p.GetBonePosition(HumanBodyBones.Head));
+            if (dist < min) { min = dist; best = p; }
+        }
+        return best;
+    }
+
+    private float GetDyNorm(float dyRaw, bool isRight)
+    {
+        Vector3 wrist = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightHand : HumanBodyBones.LeftHand);
+        Vector3 fore = localPlayer.GetBonePosition(isRight ? HumanBodyBones.RightLowerArm : HumanBodyBones.LeftLowerArm);
+        float refLen = (wrist != Vector3.zero && fore != Vector3.zero) ? Vector3.Distance(wrist, fore) : 0.11f;
+        if (refLen < 0.07f) refLen = 0.11f;
+        float n = dyRaw / refLen; if (n < 0f) n = 0f; if (n > 1.5f) n = 1.5f;
+        return n;
+    }
+
+    // ───────── WhisperRelay から受け取る受信サンプル ─────────
+    public void OnWhisperEnter(float dR, float dL)  { OnSample(dR, dL, "ENTER"); }
+    public void OnWhisperPing(float dR, float dL, bool keepAlive) { OnSample(dR, dL, keepAlive ? "PING_KEEPALIVE" : "PING"); }
+    public void OnWhisperExit()
+    {
+        lastPingTime = Time.time;
+        unstableCounter = confirmCount;
+        stableCounter = 0;
+        if (isReceiving)
+        {
+            isReceiving = false;
+            Debug.Log($"{LOG} RECV_STOP reason=exit");
+            UpdateLabel("受信: ❌ (exit)");
+        }
+    }
+
+    private void OnSample(float dR, float dL, string tag)
+    {
+        lastPingTime = Time.time;
+
+        float near = Mathf.Min(dR, dL);            // 耳の区別なし
+        bool inRange  = near <= enterDistance;     // ON候補
+        bool outRange = near >= exitDistance;      // OFF候補
+
+        Debug.Log($"{LOG} SAMPLE tag={tag} near={near:F2}");
+
+        if (inRange)
+        {
+            stableCounter++;
+            unstableCounter = 0;
+
+            if (!isReceiving && stableCounter >= confirmCount)
             {
-                float bend = Vector3.Angle(v1, v2); // 0°に近いほど真っ直ぐ
-                return bend <= th;
+                isReceiving = true;
+                Debug.Log($"{LOG} RECV_START near={near:F2}");
+                UpdateLabel($"受信: ✅ ({near:F2}m)");
+            }
+            else if (isReceiving)
+            {
+                UpdateLabel($"受信: ✅ ({near:F2}m)");
             }
         }
-        Quaternion rProx = localPlayer.GetBoneRotation(prox);
-        Quaternion rDist = localPlayer.GetBoneRotation(dist);
-        float bendFallback = Vector3.Angle(rProx * Vector3.forward, rDist * Vector3.forward);
-        return bendFallback <= th;
+        else if (outRange)
+        {
+            unstableCounter++;
+            stableCounter = 0;
+
+            if (isReceiving && unstableCounter >= confirmCount)
+            {
+                isReceiving = false;
+                Debug.Log($"{LOG} RECV_STOP near={near:F2}");
+                UpdateLabel($"受信: ❌ ({near:F2}m)");
+            }
+            else if (!isReceiving)
+            {
+                UpdateLabel($"受信: ❌ ({near:F2}m)");
+            }
+        }
+        // ヒステリシス帯（enter < near < exit）は状態維持
+    }
+
+    private void UpdateLabel(string text)
+    {
+        if (replyLabelTMP  != null) replyLabelTMP.text  = text;
+        if (replyLabelUGUI != null) replyLabelUGUI.text = text;
     }
 
     private void _TickDuck()
