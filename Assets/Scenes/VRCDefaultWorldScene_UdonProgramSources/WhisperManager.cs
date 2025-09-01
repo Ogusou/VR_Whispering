@@ -10,15 +10,16 @@ using UnityEngine.UI;
 /// 役割：
 ///  - 『話し手（ローカル）』の囁き判定
 ///  - 音声距離の切替／ローカルFX（ビネット・アイコン・ハプティクス・ダッキング）
-///  - 受信安定性チェック（耳の区別なし：near = min(dR,dL) を debug.log & ReplyLabel に表示）
-///  - ネットワーク通知や『被囁き（リスナー）側の表示』は WhisperReply/WhisperRelay に委譲
+///  - ネットワーク通知や『被囁き（リスナー）側の表示』は WhisperReply に委譲
+///     ↳ 必要なら inspector で `reply` に WhisperReply を割り当ててください。
+///  - 受信側安定性ログ（ReplyLabel）も受け取り表示可能（OnWhisperEnter/Ping/Exit）
 /// </summary>
 public class WhisperManager : UdonSharpBehaviour
 {
     // ───────── 依存（ネットワーク配信は別コンポーネントへ） ─────────
     [Header("Relay (optional)")]
-    [Tooltip("WhisperReply/WhisperRelay を指定すると、囁き開始/継続/終了で TalkerEnter/TalkerTick/TalkerExit を呼びます")]
-    public UdonBehaviour reply; // WhisperRelay 側に public メソッド名 "TalkerEnter/ TalkerTick/ TalkerExit" を用意
+    [Tooltip("WhisperReply を指定すると、囁き開始/継続/終了タイミングで TalkerEnter/TalkerTick/TalkerExit を呼びます")]
+    public UdonBehaviour reply; // WhisperReply 側に public メソッド名 "TalkerEnter/ TalkerTick/ TalkerExit" を用意
 
     // ───────── 基本設定 ─────────
     [Header("距離しきい値 (m)")]
@@ -68,7 +69,8 @@ public class WhisperManager : UdonSharpBehaviour
     public TextMeshProUGUI profileLabel;
     public TextMeshProUGUI stateLabel;
 
-    [Header("Reply Label（受信安定性の表示用：どちらか片方でOK）")]
+    [Header("Reply Label (Listener)")]
+    [Tooltip("受信安定性の表示先（どちらか/両方未設定でもOK）")]
     public TextMeshProUGUI replyLabelTMP;
     public Text replyLabelUGUI;
 
@@ -91,7 +93,7 @@ public class WhisperManager : UdonSharpBehaviour
     [Tooltip("グリップ押下と判定するしきい値（0〜1）")]
     public float gripPressThreshold = 0.8f;
     private bool _prevGripR = false, _prevGripL = false;
-    private int _selectedHand = -1; // 0=Right,1=Left,-1=Auto
+    private int _selectedHand = -1;
 
     // ───────── Whisper FX（見た目：ビネット）─────────
     [Header("Whisper FX - Vignette (ローカル画面の周辺暗転)")]
@@ -207,8 +209,7 @@ public class WhisperManager : UdonSharpBehaviour
     [Tooltip("囁きを解除するときの戻し時間(秒)")]
     public float duckFadeOutTime = 0.20f;
 
-    // ───────── 受信安定性（耳の区別なし）─────────
-    [Header("受信安定性（near = min(dR,dL)）")]
+    [Header("判定しきい値（耳の区別なし：near = min(dR,dL)）")]
     [Tooltip("受信開始（これ以下でON候補）")]
     public float enterDistance = 0.40f;
     [Tooltip("受信終了（これ以上でOFF候補）")]
@@ -319,30 +320,17 @@ public class WhisperManager : UdonSharpBehaviour
     {
         if (localPlayer == null) return;
 
-        // 手の選択（初期状態）
-        bool evalRight = (activeHandsMode != 1);
-        bool evalLeft  = (activeHandsMode != 0);
-
-        // グリップで手選択（両手モードのみ）
-        if (enableGripSwitch && activeHandsMode == 2 && localPlayer.IsUserInVR())
+        // ───── プロファイル表示（常時更新） ─────
+        if (profileLabel != null)
         {
-            float gripR = Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryHandTrigger");
-            float gripL = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryHandTrigger");
-            bool rNow = gripR >= gripPressThreshold;
-            bool lNow = gripL >= gripPressThreshold;
-            bool rDown = rNow && !_prevGripR;
-            bool lDown = lNow && !_prevGripL;
-            _prevGripR = rNow; _prevGripL = lNow;
-
-            if (rDown && !lDown) _selectedHand = 0;
-            else if (lDown && !rDown) _selectedHand = 1;
-            else if (rDown && lDown) _selectedHand = 0; // 同時押しは右優先
-
-            if (_selectedHand == 0) { evalRight = true;  evalLeft = false; }
-            else if (_selectedHand == 1) { evalRight = false; evalLeft = true;  }
+            string hands = (activeHandsMode == 0) ? "Right" : (activeHandsMode == 1) ? "Left" : "Both";
+            string sel = (activeHandsMode == 2 && enableGripSwitch)
+                            ? (_selectedHand == 0 ? "Right" : _selectedHand == 1 ? "Left" : "Auto")
+                            : "N/A";
+            profileLabel.text = $"Hands:{hands}  Sel:{sel}  ModeDet:{(enableModeDetection ? "ON" : "OFF")}";
         }
 
-        // デバッグ強制 ON（見た目等だけ動かす）
+        // デバッグ強制 ON
         if (debugForced)
         {
             if (!isWhispering)
@@ -361,19 +349,31 @@ public class WhisperManager : UdonSharpBehaviour
             UpdateBoolTMP(distanceLabel, true, "距離");
             UpdateBoolTMP(fingerLabel, true, "指");
             if (orientLabel != null) orientLabel.text = "掌向き: Debug";
-
-            // プロファイル表示（常時更新）
-            UpdateProfileLabel(evalRight, evalLeft, true, true);
-
-            // 受信タイムアウト監視（デバッグ中も動かす）
-            if (isReceiving && (Time.time - lastPingTime) > pingTimeoutSec)
-            {
-                isReceiving = false;
-                stableCounter = 0;
-                Debug.Log($"{LOG} RECV_STOP reason=timeout");
-                UpdateLabel("受信: ❌ (timeout)");
-            }
             return;
+        }
+
+        // 手の選択
+        bool evalRight = (activeHandsMode != 1);
+        bool evalLeft = (activeHandsMode != 0);
+
+        // グリップで手選択（両手モードのみ）
+        if (enableGripSwitch && activeHandsMode == 2 && localPlayer.IsUserInVR())
+        {
+            float gripR = Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryHandTrigger");
+            float gripL = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryHandTrigger");
+            bool rNow = gripR >= gripPressThreshold;
+            bool lNow = gripL >= gripPressThreshold;
+            bool rDown = rNow && !_prevGripR;
+            bool lDown = lNow && !_prevGripL;
+            _prevGripR = rNow; _prevGripL = lNow;
+
+            if (rDown && !lDown) _selectedHand = 0;
+            else if (lDown && !rDown) _selectedHand = 1;
+            else if (rDown && lDown) _selectedHand = 0;
+
+            if (_selectedHand == 0) { evalRight = true; evalLeft = false; }
+            else if (_selectedHand == 1) { evalRight = false; evalLeft = true; }
+            else { evalRight = false; evalLeft = false; }
         }
 
         // 手ごとの評価
@@ -381,7 +381,7 @@ public class WhisperManager : UdonSharpBehaviour
         float rDot = 0f, lDot = 0f, rDy = 0f, lDy = 0f;
 
         bool loosened = useExitLoosenedThresholds && isWhispering;
-        if (evalRight) rOK = EvaluateHand(true,  loosened, out rDot, out rDy, out rOrient);
+        if (evalRight) rOK = EvaluateHand(true, loosened, out rDot, out rDy, out rOrient);
         if (evalLeft)  lOK = EvaluateHand(false, loosened, out lDot, out lDy, out lOrient);
 
         bool anyWhisper = rOK || lOK;
@@ -414,7 +414,7 @@ public class WhisperManager : UdonSharpBehaviour
             TriggerExitHaptics(hapticHand, evalRight, evalLeft);
         }
 
-        // ネットワーク配信（WhisperRelay に委譲）
+        // ネットワーク配信（WhisperReply に委譲）
         if (isWhispering && reply != null) reply.SendCustomEvent("TalkerTick");
 
         // FX 更新
@@ -425,10 +425,7 @@ public class WhisperManager : UdonSharpBehaviour
         _TickIconTransform();
         _TickDuck();
 
-        // プロファイル表示（常時更新）
-        UpdateProfileLabel(evalRight, evalLeft, rOK, lOK);
-
-        // Pingが途切れたら停止扱い（受信安定性）
+        // Pingが途切れたら停止扱い（受信安定性表示）
         if (isReceiving && (Time.time - lastPingTime) > pingTimeoutSec)
         {
             isReceiving = false;
@@ -687,7 +684,7 @@ public class WhisperManager : UdonSharpBehaviour
         // ダッキング（話し手）
         _duckTarget = 1f;
 
-        // ネットワーク配信（WhisperRelay に委譲）
+        // ネットワーク配信（WhisperReply に委譲）
         if (reply != null) reply.SendCustomEvent("TalkerEnter");
     }
 
@@ -707,7 +704,7 @@ public class WhisperManager : UdonSharpBehaviour
         _ledTarget = 0f;
         _duckTarget = 0f;
 
-        // ネットワーク配信（WhisperRelay に委譲）
+        // ネットワーク配信（WhisperReply に委譲）
         if (reply != null) reply.SendCustomEvent("TalkerExit");
     }
 
@@ -721,16 +718,6 @@ public class WhisperManager : UdonSharpBehaviour
     {
         if (stateLabel == null) return;
         stateLabel.text = on ? "Whispering" : "Normal";
-    }
-
-    private void UpdateProfileLabel(bool evalRight, bool evalLeft, bool rActive, bool lActive)
-    {
-        if (profileLabel == null) return;
-        string mode = (activeHandsMode == 0) ? "Right" : (activeHandsMode == 1) ? "Left" : "Both";
-        string sel  = (_selectedHand == 0) ? "Right" : (_selectedHand == 1) ? "Left" : "Auto";
-        string enabled = $"R:{(evalRight ? "ON" : "off")}  L:{(evalLeft ? "ON" : "off")}";
-        string active  = $"R:{(rActive ? "●" : "・")}  L:{(lActive ? "●" : "・")}";
-        profileLabel.text = $"Hands:{mode}  Enabled[{enabled}]  Active[{active}]  Select:{sel}";
     }
 
     // ───────── FX（ビネット）─────────
@@ -968,7 +955,7 @@ public class WhisperManager : UdonSharpBehaviour
         return n;
     }
 
-    // ───────── WhisperRelay から受け取る受信サンプル ─────────
+    // ===== Listener 安定性表示（WhisperRelay から転送呼び出し）=====
     public void OnWhisperEnter(float dR, float dL)  { OnSample(dR, dL, "ENTER"); }
     public void OnWhisperPing(float dR, float dL, bool keepAlive) { OnSample(dR, dL, keepAlive ? "PING_KEEPALIVE" : "PING"); }
     public void OnWhisperExit()
@@ -1035,6 +1022,7 @@ public class WhisperManager : UdonSharpBehaviour
         if (replyLabelUGUI != null) replyLabelUGUI.text = text;
     }
 
+    // ───────────────── Ducking ─────────────────
     private void _TickDuck()
     {
         if (duckTargets == null || duckTargets.Length == 0) return;
