@@ -230,18 +230,14 @@ public class WhisperRelay : UdonSharpBehaviour
         ok = _IsMyHeadNearSpeakersHandEx(sp, listenerStartDistance, out ear, out dR2, out dL2);
         if (ok)
         {
-            _speakerId = sp.playerId;
-            _earRight = ear;
-            _MarkAlive();
-            _SetListenerVisual(true, _earRight);
-
-            if (forwardToManager && manager != null) manager.OnWhisperPing(dR2, dL2, false);
-
+            // ... late activate ...
             L($"RECV Ping (late activate) from {sp.playerId}:{sp.displayName} ear={(ear ? "R" : "L")} dR={dR2:F2} dL={dL2:F2}");
-            {
-                L($"RECV Ping from {sp.playerId}:{sp.displayName} ignored (not near) dR={dR2:F2} dL={dL2:F2}");
-            }
         }
+        else
+        {
+            L($"RECV Ping from {sp.playerId}:{sp.displayName} ignored (not near) dR={dR2:F2} dL={dL2:F2}");
+        }
+
     }
 
     public void W_Exit()
